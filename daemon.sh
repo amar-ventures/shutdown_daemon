@@ -1,4 +1,4 @@
 #!/bin/bash
 
-
-node ~/basescripts/shutdown_daemon/app.js &
+cd ~/basescripts/shutdown-daemon
+node app.js &
