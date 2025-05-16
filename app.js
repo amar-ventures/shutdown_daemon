@@ -16,11 +16,14 @@ const TOKEN_FILE = path.join(CONFIG_DIR, 'token.json');
 const PERMISSIONS = 0o600; // Read/write for owner only
 const DEVICE_ID = os.hostname(); // Use hostname as device ID
 const MIN_UPTIME_BEFORE_SHUTDOWN = 60000; // 1 minute in ms
-const STATUS_UPDATE_INTERVAL = 60000; // 1 minute in ms
+const STATUS_UPDATE_INTERVAL = 180000; // 3 minutes in ms (changed from 1 minute)
 const SHUTDOWN_DELAY = 5000; // 5 second delay before shutdown
 const TOKEN_REFRESH_INTERVAL = 45 * 60 * 1000; // 45 minutes
+const NETWORK_ERROR_RETRY_DELAY = 300000; // 5 minutes in ms
 const MAX_RETRIES = 3;
 let tokenRefreshInterval;
+let statusInterval;
+let retryTimeout;
 
 const firebaseConfig = {
     apiKey: process.env.FIREBASE_API_KEY,
@@ -40,8 +43,6 @@ const rl = readline.createInterface({
     input: process.stdin,
     output: process.stdout
 });
-
-let statusInterval;
 
 // Function to ensure config directory exists
 async function ensureConfigDir() {
@@ -100,12 +101,12 @@ function getCurrentUID() {
     return currentUser.uid;
 }
 
-// Function to update device status
-async function updateDeviceStatus() {
+// Function to update device status with retry mechanism
+async function updateDeviceStatus(retryCount = 0) {
     const uid = getCurrentUID();
     if (!uid) {
         console.error('Cannot update device status: No user ID found.');
-        process.exit(1);
+        setTimeout(startApp, NETWORK_ERROR_RETRY_DELAY);
         return;
     }
 
@@ -126,15 +127,22 @@ async function updateDeviceStatus() {
         });
     } catch (error) {
         console.error(`Failed to update device status for ${uid}/${DEVICE_ID}:`, error);
+        if (retryCount < MAX_RETRIES) {
+            const backoffTime = 5000 * Math.pow(2, retryCount); // Exponential backoff
+            console.log(`Retrying device status update in ${backoffTime/1000} seconds...`);
+            setTimeout(() => updateDeviceStatus(retryCount + 1), backoffTime);
+        } else {
+            console.log(`Max retries reached for status update. Will try again at next scheduled interval.`);
+        }
     }
 }
 
-// Function to mark shutdown status
-async function markShutdownStatus(status) {
+// Function to mark shutdown status with retry
+async function markShutdownStatus(status, retryCount = 0) {
     const uid = getCurrentUID();
     if (!uid) {
         console.error('Cannot mark shutdown status: No user ID found.');
-        process.exit(1);
+        setTimeout(startApp, NETWORK_ERROR_RETRY_DELAY);
         return;
     }
 
@@ -147,6 +155,11 @@ async function markShutdownStatus(status) {
         });
     } catch (error) {
         console.error(`Failed to mark shutdown status for ${uid}/${DEVICE_ID}:`, error);
+        if (retryCount < MAX_RETRIES) {
+            const backoffTime = 5000 * Math.pow(2, retryCount); // Exponential backoff
+            console.log(`Retrying marking shutdown status in ${backoffTime/1000} seconds...`);
+            setTimeout(() => markShutdownStatus(status, retryCount + 1), backoffTime);
+        }
     }
 }
 
@@ -165,42 +178,65 @@ async function shutdownSystem() {
     }, SHUTDOWN_DELAY);
 }
 
-// Function to start listening for shutdown requests
-async function listenForShutdown() {
+// Function to listen for shutdown requests with error handling
+async function listenForShutdown(retryCount = 0) {
     const uid = getCurrentUID();
     if (!uid) {
         console.error('Cannot listen for shutdown requests: No user ID found.');
-        process.exit(1);
+        setTimeout(startApp, NETWORK_ERROR_RETRY_DELAY);
         return;
     }
 
     console.log(`Listening for shutdown requests for user: ${uid}, device: ${DEVICE_ID}`);
     const shutdownRef = ref(database, `users/${uid}/devices/${DEVICE_ID}/shutdown_requested`);
-    onValue(shutdownRef, async (snapshot) => {
-        const request = snapshot.val();
-        
-        if (!request || request.status !== 'pending') {
-            return;
-        }
+    
+    try {
+        onValue(shutdownRef, async (snapshot) => {
+            try {
+                const request = snapshot.val();
+                
+                if (!request || request.status !== 'pending') {
+                    return;
+                }
 
-        if (request.expires_at && Date.now() > request.expires_at) {
-            console.log(`Shutdown request expired for ${uid}/${DEVICE_ID}`);
-            await markShutdownStatus('expired');
-            return;
-        }
-        
-        const deviceNodeRef = ref(database, `users/${uid}/devices/${DEVICE_ID}`);
-        const deviceSnapshot = await get(deviceNodeRef);
-        const deviceData = deviceSnapshot.val();
+                if (request.expires_at && Date.now() > request.expires_at) {
+                    console.log(`Shutdown request expired for ${uid}/${DEVICE_ID}`);
+                    await markShutdownStatus('expired');
+                    return;
+                }
+                
+                const deviceNodeRef = ref(database, `users/${uid}/devices/${DEVICE_ID}`);
+                const deviceSnapshot = await get(deviceNodeRef);
+                const deviceData = deviceSnapshot.val();
 
-        if (deviceData && deviceData.first_online_at && (Date.now() - deviceData.first_online_at < MIN_UPTIME_BEFORE_SHUTDOWN)) {
-            console.log(`System ${DEVICE_ID} for user ${uid} recently booted, skipping shutdown`);
-            return;
-        }
+                if (deviceData && deviceData.first_online_at && 
+                    (Date.now() - deviceData.first_online_at < MIN_UPTIME_BEFORE_SHUTDOWN)) {
+                    console.log(`System ${DEVICE_ID} for user ${uid} recently booted, skipping shutdown`);
+                    return;
+                }
 
-        console.log(`Valid shutdown request received for ${uid}/${DEVICE_ID}!`);
-        await shutdownSystem();
-    });
+                console.log(`Valid shutdown request received for ${uid}/${DEVICE_ID}!`);
+                await shutdownSystem();
+            } catch (error) {
+                console.error('Error processing shutdown request:', error);
+                // Continue listening - don't exit
+            }
+        }, (error) => {
+            console.error('Error setting up listener:', error);
+            // If listener fails, restart it after delay
+            setTimeout(() => listenForShutdown(0), NETWORK_ERROR_RETRY_DELAY); 
+        });
+    } catch (error) {
+        console.error('Failed to start shutdown listener:', error);
+        if (retryCount < MAX_RETRIES) {
+            const backoffTime = 5000 * Math.pow(2, retryCount);
+            console.log(`Retrying listener setup in ${backoffTime/1000} seconds...`);
+            setTimeout(() => listenForShutdown(retryCount + 1), backoffTime);
+        } else {
+            console.log(`Max retries reached for listener setup. Will try again in ${NETWORK_ERROR_RETRY_DELAY/1000} seconds.`);
+            setTimeout(() => listenForShutdown(0), NETWORK_ERROR_RETRY_DELAY);
+        }
+    }
 }
 
 // Function to exchange custom token for ID and refresh tokens
@@ -250,9 +286,29 @@ async function refreshIdToken(refreshToken) {
     }
 }
 
-// Update the startApp function's authentication flow
+// Add a new function to handle network errors
+function handleNetworkError(error, operation, retry) {
+    console.error(`Network error during ${operation}:`, error);
+    console.log(`Will retry ${operation} in ${NETWORK_ERROR_RETRY_DELAY/1000} seconds...`);
+    
+    // Clear any existing intervals to prevent multiple parallel attempts
+    if (statusInterval) clearInterval(statusInterval);
+    if (tokenRefreshInterval) clearInterval(tokenRefreshInterval);
+    if (retryTimeout) clearTimeout(retryTimeout);
+    
+    retryTimeout = setTimeout(retry, NETWORK_ERROR_RETRY_DELAY);
+}
+
+// Update the startApp function for better resiliency
 async function startApp() {
     try {
+        console.log('Starting shutdown daemon...');
+        
+        // Clear any existing intervals/timeouts to prevent duplicates
+        if (statusInterval) clearInterval(statusInterval);
+        if (tokenRefreshInterval) clearInterval(tokenRefreshInterval);
+        if (retryTimeout) clearTimeout(retryTimeout);
+        
         let tokens;
         try {
             // Try to read existing tokens from secure storage
@@ -292,13 +348,14 @@ async function startApp() {
             } catch (tokenError) {
                 console.error('Authentication failed:', tokenError.message);
                 console.log('Please create a customtoken.txt file with your custom token.');
-                process.exit(1);
+                handleNetworkError(tokenError, 'authentication', startApp);
+                return;
             }
         }
 
         console.log('Successfully authenticated!');
 
-        // Setup token refresh interval
+        // Setup token refresh interval with resiliency
         tokenRefreshInterval = setInterval(async () => {
             try {
                 if (Date.now() > tokens.expiresAt - (5 * 60 * 1000)) {
@@ -313,7 +370,7 @@ async function startApp() {
                 }
             } catch (error) {
                 console.error('Token refresh failed:', error);
-                process.exit(1);
+                handleNetworkError(error, 'token refresh', startApp);
             }
         }, 60000);
 
@@ -325,19 +382,32 @@ async function startApp() {
         console.log(`Authenticated as user: ${uid}`);
 
         await updateDeviceStatus();
-        statusInterval = setInterval(updateDeviceStatus, STATUS_UPDATE_INTERVAL);
+        statusInterval = setInterval(() => updateDeviceStatus(), STATUS_UPDATE_INTERVAL);
         listenForShutdown();
 
     } catch (error) {
         console.error('Startup error:', error);
-        process.exit(1);
+        handleNetworkError(error, 'application startup', startApp);
     }
 }
 
+// Add improved error handling to the process
+process.on('uncaughtException', (error) => {
+    console.error('Uncaught exception:', error);
+    handleNetworkError(error, 'unhandled exception', startApp);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+    console.error('Unhandled promise rejection:', reason);
+    handleNetworkError(reason, 'unhandled promise rejection', startApp);
+});
+
+// Keep existing SIGINT handler
 process.on('SIGINT', async () => {
     console.log('\nGracefully shutting down daemon...');
     if (statusInterval) clearInterval(statusInterval);
     if (tokenRefreshInterval) clearInterval(tokenRefreshInterval);
+    if (retryTimeout) clearTimeout(retryTimeout);
     
     const uid = getCurrentUID();
     if (uid) {
