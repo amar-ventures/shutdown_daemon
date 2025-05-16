@@ -1,0 +1,33 @@
+{
+  "name": "shutdown-daemon",
+  "version": "1.0.0",
+  "description": "System shutdown daemon with Firebase integration",
+  "main": "app2.js",
+  "bin": {
+    "shutdown-daemon": "./bin/daemon.js"
+  },
+  "pkg": {
+    "assets": [
+      ".token.json",
+      "node_modules/**/*"
+    ],
+    "targets": [
+      "node18-linux-x64",
+      "node18-win-x64"
+    ]
+  },
+  "scripts": {
+    "start": "node app2.js",
+    "build": "pkg .",
+    "build:linux": "pkg . --targets node18-linux-x64 --output dist/shutdown-daemon-linux",
+    "build:windows": "pkg . --targets node18-win-x64 --output dist/shutdown-daemon-win.exe"
+  },
+  "dependencies": {
+    "axios": "^1.9.0",
+    "dotenv": "^16.0.3",
+    "firebase": "^9.0.0"
+  },
+  "devDependencies": {
+    "pkg": "^5.8.0"
+  }
+}
