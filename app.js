@@ -10,7 +10,10 @@ const os = require('os');
 const axios = require('axios'); // New import
 
 // Constants
-const TOKEN_FILE = path.join(__dirname, '.token.json'); // Updated to store JSON
+const CUSTOM_TOKEN_FILE = path.join(__dirname, '.customtoken');
+const CONFIG_DIR = path.join(os.homedir(), '.config', 'shutdown-daemon');
+const TOKEN_FILE = path.join(CONFIG_DIR, 'token.json');
+const PERMISSIONS = 0o600; // Read/write for owner only
 const DEVICE_ID = os.hostname(); // Use hostname as device ID
 const MIN_UPTIME_BEFORE_SHUTDOWN = 60000; // 1 minute in ms
 const STATUS_UPDATE_INTERVAL = 60000; // 1 minute in ms
@@ -39,6 +42,53 @@ const rl = readline.createInterface({
 });
 
 let statusInterval;
+
+// Function to ensure config directory exists
+async function ensureConfigDir() {
+    try {
+        await fs.mkdir(CONFIG_DIR, { recursive: true, mode: 0o700 });
+        return true;
+    } catch (error) {
+        console.error('Failed to create config directory:', error);
+        throw error;
+    }
+}
+
+// Function to store tokens securely
+async function storeTokens(tokens) {
+    try {
+        await ensureConfigDir();
+        await fs.writeFile(TOKEN_FILE, JSON.stringify(tokens, null, 2), { 
+            mode: PERMISSIONS 
+        });
+        console.log('Tokens stored securely');
+    } catch (error) {
+        console.error('Failed to store tokens:', error);
+        throw error;
+    }
+}
+
+// Function to read custom token from file
+async function readCustomTokenFromFile() {
+    try {
+        const token = await fs.readFile(CUSTOM_TOKEN_FILE, 'utf8');
+        const trimmedToken = token.trim();
+        console.log('Successfully read custom token from file');
+        
+        // Optionally remove the file after reading to prevent reuse
+        try {
+            await fs.unlink(CUSTOM_TOKEN_FILE);
+            console.log('Removed custom token file for security');
+        } catch (removeError) {
+            console.warn('Could not remove custom token file:', removeError.message);
+        }
+        
+        return trimmedToken;
+    } catch (error) {
+        console.error('Failed to read custom token file:', error.message);
+        throw new Error('Custom token file not found or invalid. Please create a customtoken.txt file with your token.');
+    }
+}
 
 // Function to get the current user's UID
 function getCurrentUID() {
@@ -205,7 +255,8 @@ async function startApp() {
     try {
         let tokens;
         try {
-            // Try to read existing tokens
+            // Try to read existing tokens from secure storage
+            await ensureConfigDir();
             const tokenData = await fs.readFile(TOKEN_FILE, 'utf8');
             tokens = JSON.parse(tokenData);
             console.log('Found stored tokens, attempting refresh...');
@@ -214,31 +265,35 @@ async function startApp() {
             if (Date.now() > tokens.expiresAt - (5 * 60 * 1000)) {
                 console.log('Tokens expired or expiring soon, refreshing...');
                 tokens = await refreshIdToken(tokens.refreshToken);
-                await fs.writeFile(TOKEN_FILE, JSON.stringify(tokens, null, 2));
+                await storeTokens(tokens);
             }
 
-            // Sign in with custom token if it's the first time, otherwise use ID token
+            // Sign in with appropriate token
             if (tokens.customToken) {
                 await signInWithCustomToken(auth, tokens.customToken);
             } else {
-                // Create credential from ID token
                 const credential = GoogleAuthProvider.credential(null, tokens.idToken);
                 await signInWithCredential(auth, credential);
             }
         } catch (error) {
-            // If refresh fails or no tokens found, start fresh with custom token
-            console.log('Starting fresh authentication...');
-            const customToken = await new Promise((resolve) => {
-                rl.question('Please enter your Firebase custom token: ', (token) => {
-                    rl.close();
-                    resolve(token.trim());
-                });
-            });
+            // If refresh fails or no tokens found, read from custom token file
+            console.log('No valid stored tokens found. Reading from customtoken.txt...');
             
-            // Sign in with custom token and exchange for ID/refresh tokens
-            await signInWithCustomToken(auth, customToken);
-            tokens = await exchangeCustomToken(customToken);
-            await fs.writeFile(TOKEN_FILE, JSON.stringify(tokens, null, 2));
+            try {
+                const customToken = await readCustomTokenFromFile();
+                
+                // Sign in with custom token
+                await signInWithCustomToken(auth, customToken);
+                console.log('Successfully authenticated with custom token');
+                
+                // Exchange for ID/refresh tokens
+                tokens = await exchangeCustomToken(customToken);
+                await storeTokens(tokens);
+            } catch (tokenError) {
+                console.error('Authentication failed:', tokenError.message);
+                console.log('Please create a customtoken.txt file with your custom token.');
+                process.exit(1);
+            }
         }
 
         console.log('Successfully authenticated!');
@@ -249,7 +304,7 @@ async function startApp() {
                 if (Date.now() > tokens.expiresAt - (5 * 60 * 1000)) {
                     console.log('Refreshing tokens...');
                     tokens = await refreshIdToken(tokens.refreshToken);
-                    await fs.writeFile(TOKEN_FILE, JSON.stringify(tokens, null, 2));
+                    await storeTokens(tokens);
                     
                     // Sign in with new ID token
                     const credential = GoogleAuthProvider.credential(null, tokens.idToken);
@@ -275,12 +330,6 @@ async function startApp() {
 
     } catch (error) {
         console.error('Startup error:', error);
-        try {
-            await fs.unlink(TOKEN_FILE);
-            console.log('Deleted stored tokens due to error');
-        } catch (e) {
-            // Ignore file deletion errors
-        }
         process.exit(1);
     }
 }
